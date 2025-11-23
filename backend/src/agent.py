@@ -1,4 +1,6 @@
 import logging
+import json
+from typing import Optional, List
 
 from dotenv import load_dotenv
 from livekit.agents import (
@@ -12,8 +14,8 @@ from livekit.agents import (
     cli,
     metrics,
     tokenize,
-    # function_tool,
-    # RunContext
+    function_tool,
+    RunContext
 )
 from livekit.plugins import murf, silero, google, deepgram, noise_cancellation
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
@@ -23,31 +25,135 @@ logger = logging.getLogger("agent")
 load_dotenv(".env.local")
 
 
-class Assistant(Agent):
+class BaristaAssistant(Agent):
     def __init__(self) -> None:
         super().__init__(
-            instructions="""You are a helpful voice AI assistant. The user is interacting with you via voice, even if you perceive the conversation as text.
-            You eagerly assist users with their questions by providing information from your extensive knowledge.
-            Your responses are concise, to the point, and without any complex formatting or punctuation including emojis, asterisks, or other symbols.
-            You are curious, friendly, and have a sense of humor.""",
+            instructions="""You are a friendly and knowledgeable barista at "Code & Coffee".
+            Your goal is to take the customer's coffee order efficiently while being warm and engaging.
+            
+            You need to collect the following information for an order:
+            1. Drink Type (e.g., Latte, Cappuccino, Espresso, Americano)
+            2. Size (Small, Medium, Large)
+            3. Milk preference (Whole, Skim, Oat, Almond, Soy, None)
+            4. Any extras (e.g., Vanilla syrup, Extra shot, Whipped cream) - This is optional
+            5. Customer's Name
+            
+            Behavior:
+            - Start by greeting the customer warmly
+            - Ask for the missing information one or two items at a time
+            - When the user provides information, use the update_order tool to save it
+            - Once all required fields (Drink Type, Size, Milk, Name) are collected, confirm the order
+            - After confirmation, use the submit_order tool to finalize
+            - Be helpful and friendly throughout the interaction
+            
+            Your responses should be concise and natural for voice conversation.
+            """,
         )
+        # Initialize order state
+        self.drink_type: Optional[str] = None
+        self.size: Optional[str] = None
+        self.milk: Optional[str] = None
+        self.extras: List[str] = []
+        self.name: Optional[str] = None
+        # Room reference for sending data updates
+        self._room = None
 
-    # To add tools, use the @function_tool decorator.
-    # Here's an example that adds a simple weather tool.
-    # You also have to add `from livekit.agents import function_tool, RunContext` to the top of this file
-    # @function_tool
-    # async def lookup_weather(self, context: RunContext, location: str):
-    #     """Use this tool to look up current weather information in the given location.
-    #
-    #     If the location is not supported by the weather service, the tool will indicate this. You must tell the user the location's weather is unavailable.
-    #
-    #     Args:
-    #         location: The location to look up weather information for (e.g. city name)
-    #     """
-    #
-    #     logger.info(f"Looking up weather for {location}")
-    #
-    #     return "sunny with a temperature of 70 degrees."
+    async def _send_order_update(self):
+        """Send current order state to frontend via data packet"""
+        if self._room is None:
+            logger.warning("Room not set, cannot send order update")
+            return
+            
+        order_dict = {
+            "drinkType": self.drink_type,
+            "size": self.size,
+            "milk": self.milk,
+            "extras": self.extras,
+            "name": self.name,
+        }
+        
+        try:
+            payload = json.dumps({"type": "order_update", "data": order_dict})
+            await self._room.local_participant.publish_data(
+                payload.encode('utf-8'),
+                reliable=True
+            )
+            logger.info(f"Sent order update to frontend: {order_dict}")
+        except Exception as e:
+            logger.error(f"Failed to send order update: {e}")
+
+    @function_tool
+    async def update_order(
+        self,
+        ctx: RunContext,
+        drink_type: Optional[str] = None,
+        size: Optional[str] = None,
+        milk: Optional[str] = None,
+        extras: Optional[List[str]] = None,
+        name: Optional[str] = None,
+    ):
+        """Update the current order with new information provided by the customer.
+        
+        Args:
+            drink_type: The type of coffee drink (e.g., Latte, Cappuccino)
+            size: The size of the drink (Small, Medium, Large)
+            milk: The type of milk (Whole, Skim, Oat, Almond, Soy, None)
+            extras: List of extra additions (e.g., Vanilla syrup, Extra shot, Whipped cream)
+            name: The customer's name
+        """
+        changed = False
+        if drink_type:
+            self.drink_type = drink_type
+            changed = True
+        if size:
+            self.size = size
+            changed = True
+        if milk:
+            self.milk = milk
+            changed = True
+        if extras is not None:
+            self.extras = extras
+            changed = True
+        if name:
+            self.name = name
+            changed = True
+        
+        order_dict = {
+            "drinkType": self.drink_type,
+            "size": self.size,
+            "milk": self.milk,
+            "extras": self.extras,
+            "name": self.name,
+        }
+        
+        if changed:
+            logger.info(f"Order updated: {order_dict}")
+            # Send update to frontend
+            await self._send_order_update()
+        
+        return f"Order updated successfully. Current order: Drink={self.drink_type}, Size={self.size}, Milk={self.milk}, Extras={self.extras}, Name={self.name}"
+
+    @function_tool
+    async def submit_order(self, ctx: RunContext):
+        """Finalize and submit the order after customer confirmation."""
+        order_data = {
+            "drinkType": self.drink_type,
+            "size": self.size,
+            "milk": self.milk,
+            "extras": self.extras,
+            "name": self.name,
+        }
+        
+        # Save to file
+        with open("order.json", "w") as f:
+            json.dump(order_data, f, indent=2)
+        
+        logger.info(f"Order submitted and saved to order.json: {order_data}")
+        
+        # Send final update to frontend
+        await self._send_order_update()
+        
+        return "Order submitted successfully! Thank you for choosing Code & Coffee."
 
 
 def prewarm(proc: JobProcess):
@@ -56,50 +162,34 @@ def prewarm(proc: JobProcess):
 
 async def entrypoint(ctx: JobContext):
     # Logging setup
-    # Add any other context you want in all log entries here
     ctx.log_context_fields = {
         "room": ctx.room.name,
     }
 
-    # Set up a voice AI pipeline using OpenAI, Cartesia, AssemblyAI, and the LiveKit turn detector
+    # Create the barista agent
+    barista = BaristaAssistant()
+    
+    # Set the room reference so tools can send data updates
+    barista._room = ctx.room
+
+    # Set up voice AI pipeline
     session = AgentSession(
-        # Speech-to-text (STT) is your agent's ears, turning the user's speech into text that the LLM can understand
-        # See all available models at https://docs.livekit.io/agents/models/stt/
         stt=deepgram.STT(model="nova-3"),
-        # A Large Language Model (LLM) is your agent's brain, processing user input and generating a response
-        # See all available models at https://docs.livekit.io/agents/models/llm/
         llm=google.LLM(
-                model="gemini-2.5-flash",
-            ),
-        # Text-to-speech (TTS) is your agent's voice, turning the LLM's text into speech that the user can hear
-        # See all available models as well as voice selections at https://docs.livekit.io/agents/models/tts/
+            model="gemini-2.5-flash",
+        ),
         tts=murf.TTS(
-                voice="en-US-matthew", 
-                style="Conversation",
-                tokenizer=tokenize.basic.SentenceTokenizer(min_sentence_len=2),
-                text_pacing=True
-            ),
-        # VAD and turn detection are used to determine when the user is speaking and when the agent should respond
-        # See more at https://docs.livekit.io/agents/build/turns
+            voice="en-US-matthew", 
+            style="Conversation",
+            tokenizer=tokenize.basic.SentenceTokenizer(min_sentence_len=2),
+            text_pacing=True
+        ),
         turn_detection=MultilingualModel(),
         vad=ctx.proc.userdata["vad"],
-        # allow the LLM to generate a response while waiting for the end of turn
-        # See more at https://docs.livekit.io/agents/build/audio/#preemptive-generation
         preemptive_generation=True,
     )
 
-    # To use a realtime model instead of a voice pipeline, use the following session setup instead.
-    # (Note: This is for the OpenAI Realtime API. For other providers, see https://docs.livekit.io/agents/models/realtime/))
-    # 1. Install livekit-agents[openai]
-    # 2. Set OPENAI_API_KEY in .env.local
-    # 3. Add `from livekit.plugins import openai` to the top of this file
-    # 4. Use the following session setup instead of the version above
-    # session = AgentSession(
-    #     llm=openai.realtime.RealtimeModel(voice="marin")
-    # )
-
-    # Metrics collection, to measure pipeline performance
-    # For more information, see https://docs.livekit.io/agents/build/metrics/
+    # Metrics collection
     usage_collector = metrics.UsageCollector()
 
     @session.on("metrics_collected")
@@ -113,27 +203,24 @@ async def entrypoint(ctx: JobContext):
 
     ctx.add_shutdown_callback(log_usage)
 
-    # # Add a virtual avatar to the session, if desired
-    # # For other providers, see https://docs.livekit.io/agents/models/avatar/
-    # avatar = hedra.AvatarSession(
-    #   avatar_id="...",  # See https://docs.livekit.io/agents/models/avatar/plugins/hedra
-    # )
-    # # Start the avatar and wait for it to join
-    # await avatar.start(session, room=ctx.room)
-
-    # Start the session, which initializes the voice pipeline and warms up the models
+    # Start the session
     await session.start(
-        agent=Assistant(),
+        agent=barista,
         room=ctx.room,
         room_input_options=RoomInputOptions(
-            # For telephony applications, use `BVCTelephony` for best results
             noise_cancellation=noise_cancellation.BVC(),
         ),
     )
 
-    # Join the room and connect to the user
+    # Connect to the room
     await ctx.connect()
+    
+    logger.info(f"Barista agent connected to room: {ctx.room.name}")
+
+    # Send initial empty order state to frontend
+    await barista._send_order_update()
 
 
 if __name__ == "__main__":
     cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, prewarm_fnc=prewarm))
+
