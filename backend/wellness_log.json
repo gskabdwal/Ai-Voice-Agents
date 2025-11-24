@@ -1,0 +1,17 @@
+{
+  "entries": [
+    {
+      "timestamp": "2025-11-24T21:36:45.013236",
+      "date": "November 24, 2025",
+      "mood": "good",
+      "energy": "moderate",
+      "stress": [
+        "work deadlines"
+      ],
+      "objectives": [
+        "read a book for 30 minutes"
+      ],
+      "summary": "User feeling good, energy is moderate, focused on 1 goal(s)"
+    }
+  ]
+}
